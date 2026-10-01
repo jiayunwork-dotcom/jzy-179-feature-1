@@ -1,0 +1,12 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+data/
+tests/
+/tmp/
+Dockerfile
+README.md
+.dockerignore
