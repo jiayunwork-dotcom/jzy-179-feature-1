@@ -6,6 +6,10 @@
 - 所有区都不含裂变材料     → 跨区：至少一区 νΣf > 0
 - 区数多于 50
 - 各区网格加起来多于 20000
+- 燃耗声明（可选，三个量须一起给）：
+  · 初始数密度 ≤ 0 或微观吸收截面 < 0
+  · 易裂变吸收份额不在 [0, 1]
+  · 在 νΣf = 0（不含裂变材料）的区上声明燃耗
 """
 from __future__ import annotations
 
@@ -67,12 +71,43 @@ def validate_regions(regions: list[dict]) -> list[tuple[str, str]]:
         if isinstance(nsf, (int, float)) and nsf > 0:
             any_fissile = True
 
+        errors.extend(_validate_burnup(prefix, r))
+
     if total_mesh > MAX_TOTAL_MESH:
         errors.append(("regions",
                        f"各区网格总数 {total_mesh} 超过上限 {MAX_TOTAL_MESH}"))
     if not any_fissile:
         errors.append(("regions",
                        "所有区都不含裂变材料：至少需要一个区 νΣf > 0"))
+    return errors
+
+
+def _validate_burnup(prefix: str, region: dict) -> list[tuple[str, str]]:
+    """燃耗声明的逐项校验；未声明（burnup 缺省或为 None）的区直接通过。"""
+    burn = region.get("burnup")
+    if burn is None:
+        return []
+    errors: list[tuple[str, str]] = []
+    bp = f"{prefix}.burnup"
+    if not isinstance(burn, dict):
+        return [(bp, f"燃耗声明必须是对象，收到 {burn!r}")]
+
+    n0 = burn.get("fissile_density_0")
+    if not isinstance(n0, (int, float)) or n0 <= 0:
+        errors.append((f"{bp}.fissile_density_0",
+                       f"易裂变核素初始数密度必须 > 0，收到 {n0!r}"))
+    sm = burn.get("sigma_a_micro")
+    if not isinstance(sm, (int, float)) or sm < 0:
+        errors.append((f"{bp}.sigma_a_micro",
+                       f"微观吸收截面不允许为负，收到 {sm!r}"))
+    frac = burn.get("fissile_absorption_fraction")
+    if not isinstance(frac, (int, float)) or not (0.0 <= frac <= 1.0):
+        errors.append((f"{bp}.fissile_absorption_fraction",
+                       f"易裂变吸收份额必须在 [0, 1]，收到 {frac!r}"))
+
+    nsf = region.get("nu_sigma_f")
+    if not (isinstance(nsf, (int, float)) and nsf > 0):
+        errors.append((bp, "该区 νΣf = 0（不含裂变材料），不允许声明燃耗参数"))
     return errors
 
 

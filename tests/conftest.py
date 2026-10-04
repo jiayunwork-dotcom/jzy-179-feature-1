@@ -34,6 +34,7 @@ def client(storage):
     with TestClient(app) as c:
         yield c
     app.state.jobs.shutdown()
+    app.state.burnups.shutdown()
 
 
 # 常用材料：燃料 k∞=1.2, L²=10

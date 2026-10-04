@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
@@ -31,12 +32,18 @@ EXTRAPOLATION_FACTOR = 2.13
 
 @dataclass(frozen=True)
 class Region:
-    """一个材料区：厚度、D、Σa、νΣf、网格数。"""
+    """一个材料区：厚度、D、Σa、νΣf、网格数。
+
+    burnup 为可选的燃耗声明（dict，含 fissile_density_0 / sigma_a_micro /
+    fissile_absorption_fraction，见 app/burnup.py）。离散与求解只使用
+    宏观量，从不读它；它随区参数一起版本化，由燃耗引擎解释。
+    """
     thickness: float
     D: float
     sigma_a: float
     nu_sigma_f: float
     n_mesh: int
+    burnup: Optional[dict] = None
 
     @property
     def h(self) -> float:
