@@ -1,4 +1,4 @@
-"""JSON 文件持久化：工况 / 参数版本 / 求解结果 / 作业。
+"""JSON 文件持久化：工况 / 参数版本 / 求解结果 / 作业 / 燃耗历程。
 
 - 每类对象一个文件，写入走 "临时文件 + os.replace" 原子替换，
   服务异常退出不会留下半截 JSON。
@@ -7,6 +7,9 @@
 - 目录可直接挂卷（DIFFUSION_DATA_DIR，默认 /data）。
 - 工况删除只删工况自己的版本与结果索引；作业记录里内嵌参数快照，
   因此作业永远只认提交那一刻的版本，工况被删/被改都不影响在跑的作业。
+- 燃耗历程同样内嵌版本快照；每个已完成时间点单独一个文件
+  （burnup_points/），历程文档只记进度与点索引——分段推进或服务重启后，
+  从最后一个已落盘点的状态原样继续。
 """
 from __future__ import annotations
 
@@ -71,11 +74,15 @@ class Storage:
         self.cases_dir = self.root / "cases"
         self.results_dir = self.root / "results"
         self.jobs_dir = self.root / "jobs"
-        for d in (self.cases_dir, self.results_dir, self.jobs_dir):
+        self.burnups_dir = self.root / "burnups"
+        self.burnup_points_dir = self.root / "burnup_points"
+        for d in (self.cases_dir, self.results_dir, self.jobs_dir,
+                  self.burnups_dir, self.burnup_points_dir):
             d.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._cases: dict[str, dict] = {}
         self._jobs: dict[str, dict] = {}
+        self._burnups: dict[str, dict] = {}
         self._load_all()
 
     # ---------- 底层 ----------
@@ -97,6 +104,10 @@ class Storage:
             with open(p, encoding="utf-8") as fh:
                 doc = json.load(fh)
             self._jobs[doc["id"]] = doc
+        for p in sorted(self.burnups_dir.glob("*.json")):
+            with open(p, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self._burnups[doc["id"]] = doc
 
     def _case_path(self, case_id: str) -> Path:
         return self.cases_dir / f"{case_id}.json"
@@ -107,11 +118,20 @@ class Storage:
     def _job_path(self, job_id: str) -> Path:
         return self.jobs_dir / f"{job_id}.json"
 
+    def _burnup_path(self, burnup_id: str) -> Path:
+        return self.burnups_dir / f"{burnup_id}.json"
+
+    def _burnup_point_path(self, point_id: str) -> Path:
+        return self.burnup_points_dir / f"{point_id}.json"
+
     def _save_case(self, case: dict) -> None:
         self._atomic_write_json(self._case_path(case["id"]), case)
 
     def _save_job(self, job: dict) -> None:
         self._atomic_write_json(self._job_path(job["id"]), job)
+
+    def _save_burnup(self, burnup: dict) -> None:
+        self._atomic_write_json(self._burnup_path(burnup["id"]), burnup)
 
     # ---------- 工况 ----------
 
@@ -199,7 +219,8 @@ class Storage:
                     raise NotFound(
                         f"region_index={region_index} 越界（共 {len(new_regions)} 区）")
                 before = copy.deepcopy(new_regions[region_index])
-                for key in ("thickness", "D", "sigma_a", "nu_sigma_f", "n_mesh"):
+                for key in ("thickness", "D", "sigma_a", "nu_sigma_f",
+                            "n_mesh", "burnup"):
                     val = region_patch.get(key)
                     if val is not None:
                         new_regions[region_index][key] = val
@@ -375,6 +396,89 @@ class Storage:
                     job["message"] = "服务重启，作业未完成（不自动恢复）"
                     self._save_job(job)
                     recovered.append(job["id"])
+        return recovered
+
+    # ---------- 燃耗历程 ----------
+
+    def save_burnup(self, burnup: dict) -> None:
+        with self._lock:
+            self._burnups[burnup["id"]] = copy.deepcopy(burnup)
+            self._save_burnup(burnup)
+
+    def update_burnup(self, burnup_id: str, **fields) -> dict:
+        with self._lock:
+            burnup = self._burnups.get(burnup_id)
+            if burnup is None:
+                raise NotFound(f"燃耗历程 {burnup_id} 不存在")
+            burnup.update(fields)
+            self._save_burnup(burnup)
+            return copy.deepcopy(burnup)
+
+    def get_burnup(self, burnup_id: str) -> dict:
+        with self._lock:
+            burnup = self._burnups.get(burnup_id)
+            if burnup is None:
+                path = self._burnup_path(burnup_id)
+                if path.exists():
+                    with open(path, encoding="utf-8") as fh:
+                        burnup = json.load(fh)
+                    self._burnups[burnup_id] = burnup
+                else:
+                    raise NotFound(f"燃耗历程 {burnup_id} 不存在")
+            return copy.deepcopy(burnup)
+
+    def list_burnups(self, case_id: Optional[str] = None) -> list[dict]:
+        with self._lock:
+            docs = [copy.deepcopy(b) for b in self._burnups.values()]
+        if case_id:
+            docs = [d for d in docs if d["case_id"] == case_id]
+        docs.sort(key=lambda d: d["created_at"])
+        return docs
+
+    def add_burnup_point(self, burnup_id: str, point: dict,
+                         progress: dict) -> dict:
+        """落盘一个已完成时间点，并在同一把锁里推进历程进度。
+
+        先写时间点文件、再更新历程文档（点索引 + 进度）；崩溃只可能留下
+        未被索引的孤儿点文件，不会让历程引用一个不存在的点。
+        """
+        with self._lock:
+            burnup = self._burnups.get(burnup_id)
+            if burnup is None:
+                raise NotFound(f"燃耗历程 {burnup_id} 不存在")
+            point_id = new_id("bp")
+            doc = {"id": point_id, "created_at": utc_now(), **point}
+            self._atomic_write_json(self._burnup_point_path(point_id), doc)
+            burnup["point_ids"].append(point_id)
+            burnup.update(progress)
+            self._save_burnup(burnup)
+            return copy.deepcopy(doc)
+
+    def get_burnup_point(self, point_id: str) -> dict:
+        path = self._burnup_point_path(point_id)
+        if not path.exists():
+            raise NotFound(f"燃耗时间点 {point_id} 不存在")
+        with self._lock:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+
+    def list_burnup_points(self, burnup_id: str) -> list[dict]:
+        burnup = self.get_burnup(burnup_id)
+        docs = [self.get_burnup_point(pid) for pid in burnup["point_ids"]]
+        docs.sort(key=lambda d: d["step_index"])
+        return docs
+
+    def recover_interrupted_burnups(self) -> list[str]:
+        """启动时把仍在 running 的历程标为 interrupted（不自动续跑，可手动继续）。"""
+        recovered = []
+        with self._lock:
+            for burnup in self._burnups.values():
+                if burnup["status"] == "running":
+                    burnup["status"] = "interrupted"
+                    burnup["finished_at"] = utc_now()
+                    burnup["message"] = "服务重启，推进中断（可从已完成点继续）"
+                    self._save_burnup(burnup)
+                    recovered.append(burnup["id"])
         return recovered
 
 

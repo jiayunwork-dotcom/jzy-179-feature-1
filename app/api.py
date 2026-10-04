@@ -1,4 +1,4 @@
-"""FastAPI 路由层：工况 CRUD、求解、结果留档、临界搜索作业。"""
+"""FastAPI 路由层：工况 CRUD、求解、结果留档、临界搜索作业、燃耗历程。"""
 from __future__ import annotations
 
 from typing import Optional
@@ -7,10 +7,16 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from .discretization import BoundaryCondition, Region, build_mesh
+from .burnups import BurnupManager, BurnupStateError
+from .discretization import BoundaryCondition, build_mesh, region_from_dict
 from .interpolation import piecewise_linear_remap
 from .jobs import JobManager, result_to_doc
 from .models import (
+    BurnupAdvance,
+    BurnupCreate,
+    BurnupOut,
+    BurnupPointOut,
+    BurnupPointSummary,
     CaseCreate,
     CaseOut,
     CasePatch,
@@ -30,15 +36,18 @@ from .storage import NotFound, Storage
 from .validation import validate_payload
 
 
-def create_app(storage: Storage, eval_delay: float = 0.0) -> FastAPI:
+def create_app(storage: Storage, eval_delay: float = 0.0,
+               burnup_step_delay: float = 0.0) -> FastAPI:
     app = FastAPI(
         title="一维平板单群扩散特征值服务",
-        version="1.0.0",
-        description="多区平板 k_eff 求解、版本化工况与异步临界搜索",
+        version="1.1.0",
+        description="多区平板 k_eff 求解、版本化工况、异步临界搜索与燃耗历程",
     )
     jobs = JobManager(storage, eval_delay=eval_delay)
+    burnups = BurnupManager(storage, step_delay=burnup_step_delay)
     app.state.storage = storage
     app.state.jobs = jobs
+    app.state.burnups = burnups
 
     # ---------- 异常 ----------
 
@@ -112,7 +121,7 @@ def create_app(storage: Storage, eval_delay: float = 0.0) -> FastAPI:
 
     @app.post("/cases", response_model=CaseOut, status_code=201)
     def create_case(body: CaseCreate):
-        regions_data = [r.model_dump() for r in body.regions]
+        regions_data = [r.model_dump(exclude_none=True) for r in body.regions]
         _check_regions(regions_data)
         case = storage.create_case({
             "name": body.name,
@@ -221,7 +230,7 @@ def create_app(storage: Storage, eval_delay: float = 0.0) -> FastAPI:
                 })
             warm_result_id = warm_source["id"]
 
-        regions = [Region(**r) for r in ver["regions"]]
+        regions = [region_from_dict(r) for r in ver["regions"]]
         mesh = build_mesh(regions)
         left = BoundaryCondition(ver["left_boundary"])
         right = BoundaryCondition(ver["right_boundary"])
@@ -299,5 +308,88 @@ def create_app(storage: Storage, eval_delay: float = 0.0) -> FastAPI:
     @app.post("/jobs/{job_id}/cancel", response_model=JobOut)
     def cancel_job(job_id: str):
         return jobs.cancel(job_id)
+
+    # ---------- 燃耗历程 ----------
+
+    def _burnup_out(doc: dict) -> dict:
+        return {
+            "id": doc["id"],
+            "case_id": doc["case_id"],
+            "case_name": doc["case_name"],
+            "version": doc["version"],
+            "status": doc["status"],
+            "steps": doc["steps"],
+            "total_steps": len(doc["steps"]),
+            "steps_completed": doc["steps_completed"],
+            "current_time_days": doc["current_time_days"],
+            "current_k": doc["current_k"],
+            "cancelled": doc["cancelled"],
+            "message": doc["message"],
+            "created_at": doc["created_at"],
+            "started_at": doc["started_at"],
+            "finished_at": doc["finished_at"],
+            "note": doc["note"],
+        }
+
+    @app.post("/cases/{case_id}/burnups", response_model=BurnupOut,
+              status_code=202)
+    def create_burnup(case_id: str, body: BurnupCreate):
+        try:
+            hist = burnups.create(case_id, body.model_dump())
+        except NotFound:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=422,
+                                detail={"error": str(exc), "details": []})
+        return _burnup_out(hist)
+
+    @app.get("/burnups", response_model=list[BurnupOut])
+    def list_burnups(case_id: Optional[str] = Query(default=None)):
+        return [_burnup_out(d) for d in storage.list_burnups(case_id)]
+
+    @app.get("/burnups/{burnup_id}", response_model=BurnupOut)
+    def get_burnup(burnup_id: str):
+        return _burnup_out(storage.get_burnup(burnup_id))
+
+    @app.post("/burnups/{burnup_id}/advance", response_model=BurnupOut,
+              status_code=202)
+    def advance_burnup(burnup_id: str, body: Optional[BurnupAdvance] = None):
+        max_steps = body.max_steps if body is not None else None
+        try:
+            hist = burnups.advance(burnup_id, max_steps)
+        except NotFound:
+            raise
+        except BurnupStateError as exc:
+            raise HTTPException(status_code=409,
+                                detail={"error": str(exc), "details": []})
+        except ValueError as exc:
+            raise HTTPException(status_code=422,
+                                detail={"error": str(exc), "details": []})
+        return _burnup_out(hist)
+
+    @app.post("/burnups/{burnup_id}/cancel", response_model=BurnupOut)
+    def cancel_burnup(burnup_id: str):
+        return _burnup_out(burnups.cancel(burnup_id))
+
+    @app.get("/burnups/{burnup_id}/points",
+             response_model=list[BurnupPointSummary])
+    def list_burnup_points(burnup_id: str):
+        storage.get_burnup(burnup_id)  # 不存在抛 404
+        return [{
+            "id": p["id"],
+            "step_index": p["step_index"],
+            "time_days": p["time_days"],
+            "k_eff": p["k_eff"],
+        } for p in storage.list_burnup_points(burnup_id)]
+
+    @app.get("/burnups/{burnup_id}/points/{step_index}",
+             response_model=BurnupPointOut)
+    def get_burnup_point(burnup_id: str, step_index: int):
+        hist = storage.get_burnup(burnup_id)
+        if not (0 <= step_index < len(hist["point_ids"])):
+            raise NotFound(
+                f"燃耗历程 {burnup_id} 还没有第 {step_index} 个时间点"
+                f"（已完成 {len(hist['point_ids']) - 1} 步）")
+        return storage.get_burnup_point(hist["point_ids"][step_index])
 
     return app

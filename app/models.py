@@ -3,11 +3,21 @@
 """
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, Field
 
 BoundaryKind = Literal["zero_flux", "extrapolated", "reflective"]
+
+
+class RegionBurnup(BaseModel):
+    """区的燃耗声明（可选）。未声明的区不燃耗，参数始终不变。"""
+    initial_density: float = Field(
+        ..., gt=0, description="易裂变核素初始数密度 (10^24/cm^3)，必须 > 0")
+    micro_sigma_a: float = Field(
+        ..., ge=0, description="微观吸收截面 (barn)，≥ 0；为 0 时不消耗")
+    fissile_absorption_fraction: float = Field(
+        ..., ge=0, le=1, description="Σa 中来自易裂变核素的份额，∈ [0,1]")
 
 
 class RegionIn(BaseModel):
@@ -16,6 +26,7 @@ class RegionIn(BaseModel):
     sigma_a: float = Field(..., ge=0, description="宏观吸收截面 (cm^-1)，≥ 0")
     nu_sigma_f: float = Field(..., ge=0, description="νΣf (cm^-1)，≥ 0")
     n_mesh: int = Field(..., ge=1, description="该区网格数，≥ 1")
+    burnup: Optional[RegionBurnup] = None
 
 
 class BoundaryIn(BaseModel):
@@ -44,6 +55,7 @@ class RegionPatch(BaseModel):
     sigma_a: Optional[float] = Field(None, ge=0)
     nu_sigma_f: Optional[float] = Field(None, ge=0)
     n_mesh: Optional[int] = Field(None, ge=1)
+    burnup: Optional[RegionBurnup] = None
 
 
 class CasePatch(BaseModel):
@@ -72,6 +84,85 @@ class SearchRequest(BaseModel):
     note: Optional[str] = None
 
 
+# ---------- 燃耗历程 ----------
+
+MAX_BURNUP_STEPS = 500
+StepDays = Annotated[float, Field(gt=0, allow_inf_nan=False)]
+
+
+class BurnupCreate(BaseModel):
+    """新建燃耗历程：挂在工况的某一版参数上，按给定时间步序列（天）推进。"""
+    version: Optional[int] = Field(None, ge=1,
+                                   description="绑定哪一版参数；缺省为当前版本")
+    steps: list[StepDays] = Field(
+        ..., min_length=1, max_length=MAX_BURNUP_STEPS,
+        description="时间步序列（天），每步 > 0，至多 500 步")
+    max_steps: Optional[int] = Field(
+        None, ge=1, description="本次最多推进几步（分段推进用）；缺省推到底")
+    note: Optional[str] = None
+
+
+class BurnupAdvance(BaseModel):
+    """继续推进一条未完成的历程。"""
+    max_steps: Optional[int] = Field(
+        None, ge=1, description="本次最多推进几步；缺省推到底")
+
+
+class BurnupOut(BaseModel):
+    id: str
+    case_id: str
+    case_name: str
+    version: int
+    status: str            # running|paused|cancelled|interrupted|completed|failed
+    steps: list[float]
+    total_steps: int
+    steps_completed: int
+    current_time_days: float
+    current_k: Optional[float] = None
+    cancelled: bool
+    message: str
+    created_at: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    note: Optional[str] = None
+
+
+class BurnupPointSummary(BaseModel):
+    id: str
+    step_index: int
+    time_days: float
+    k_eff: float
+
+
+class BurnupPointOut(BaseModel):
+    id: str
+    burnup_id: str
+    case_id: str
+    version: int
+    step_index: int
+    time_days: float
+    created_at: str
+    k_eff: float
+    iterations: int
+    k_residual: float
+    flux_residual: float
+    region_remaining: list[float]
+    cell_remaining: list[float]
+    region_absorption: list[float]
+    region_fission: list[float]
+    leakage_left: float
+    leakage_right: float
+    total_absorption: float
+    total_fission: float
+    balance_residual: float
+    target_total_fission: float
+    n_mesh_total: int
+    centers: list[float]
+    widths: list[float]
+    region_of: list[int]
+    phi: list[float]
+
+
 # ---------- 响应模型 ----------
 
 class SettingsOut(BaseModel):
@@ -86,6 +177,7 @@ class RegionOut(BaseModel):
     sigma_a: float
     nu_sigma_f: float
     n_mesh: int
+    burnup: Optional[RegionBurnup] = None
 
 
 class CaseSummary(BaseModel):

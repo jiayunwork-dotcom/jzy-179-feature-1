@@ -16,7 +16,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from .discretization import BoundaryCondition, Region, build_mesh
+from .discretization import BoundaryCondition, build_mesh, region_from_dict
 from .interpolation import piecewise_linear_remap
 from .rootfinding import bisection, same_sign
 from .solver import (
@@ -52,7 +52,7 @@ def _settings(snap: dict) -> SolverSettings:
 
 
 def _build_mesh(snap: dict, regions_data: list[dict]):
-    regions = [Region(**r) for r in regions_data]
+    regions = [region_from_dict(r) for r in regions_data]
     return build_mesh(regions), regions
 
 

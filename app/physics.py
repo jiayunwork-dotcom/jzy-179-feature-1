@@ -18,11 +18,15 @@
   本模块给出它的精确根（手写二分）。教科书常用的 B = π/(a+2d)、
   π/[2(a+d)] 是小曲率近似（Ba≪1 时两者一致到 O((Ba)^3)），一并给出。
 - 两端反射且有裂变：B=0，k = k∞。
+
+两端全反射单区均匀板的燃耗解析参考见 uniform_burnup_reference：
+恒定总裂变率下 φ·N 为常数，数密度随时间线性下降，k(t) 随之有理式变化。
 """
 from __future__ import annotations
 
 import math
 
+from .depletion import BARN_TO_CM2, SECONDS_PER_DAY
 from .discretization import (
     EXTRAPOLATED,
     REFLECTIVE,
@@ -127,3 +131,36 @@ def analytical_k(reg: Region, left: str, right: str,
     if math.isinf(l2):
         return 0.0
     return kinf / (1.0 + l2 * b2)
+
+
+def uniform_burnup_reference(*, nu_sigma_f: float, sigma_a: float,
+                             fissile_absorption_fraction: float,
+                             micro_sigma_a: float,
+                             target_total_fission: float,
+                             thickness: float,
+                             time_days: float) -> tuple[float, float]:
+    """两端全反射单区均匀板（B=0，无空间效应）的燃耗手推参考解。
+
+    恒定总裂变率 F 下，通量被归一到 νΣf(t)·φ(t)·a = F，即
+    φ·s = F/(νΣf0·a) 为常数（s = N/N0）。于是消耗方程
+
+        ds/dt = −σ_a^micro·φ·s = −σ_a^micro·F/(νΣf0·a) = 常数
+
+    给出**线性下降**的剩余份额（t 以秒计，接口时间以天计）：
+
+        s(t) = 1 − σ_a^micro·F·t / (νΣf0·a)
+
+    B=0 时 k = νΣf/Σa，截面随 s 缩放后：
+
+        k(t) = νΣf0·s / (Σa0·(1−f) + Σa0·f·s)，f 为 Σa 的易裂变份额
+
+    返回 (s, k)。s 降到 0 以下说明燃料已烧穿（截断到 0）。
+    """
+    rate = (micro_sigma_a * BARN_TO_CM2 * target_total_fission
+            / (nu_sigma_f * thickness))          # 1/s
+    s = 1.0 - rate * (time_days * SECONDS_PER_DAY)
+    s = max(s, 0.0)
+    f = fissile_absorption_fraction
+    sa = sigma_a * ((1.0 - f) + f * s)
+    k = (nu_sigma_f * s / sa) if sa > 0.0 else 0.0
+    return s, k

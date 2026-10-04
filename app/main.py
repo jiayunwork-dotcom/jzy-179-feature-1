@@ -15,3 +15,4 @@ app = create_app(storage)
 @app.on_event("shutdown")
 def _shutdown() -> None:  # pragma: no cover
     app.state.jobs.shutdown()
+    app.state.burnups.shutdown()

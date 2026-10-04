@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
@@ -30,17 +31,44 @@ EXTRAPOLATION_FACTOR = 2.13
 
 
 @dataclass(frozen=True)
+class BurnupRegion:
+    """区的燃耗声明（可选）：易裂变核素的初始数密度、微观吸收截面、
+    以及该区 Σa 中来自易裂变核素的份额。
+
+    initial_density               初始数密度 N0，单位 10^24 atoms/cm^3（atoms/(barn·cm)）
+    micro_sigma_a                 微观吸收截面 σ_a^micro，单位 barn（消耗速率 = σ·φ·N）
+    fissile_absorption_fraction   Σa 中易裂变核素贡献的份额，∈ [0, 1]
+    """
+    initial_density: float
+    micro_sigma_a: float
+    fissile_absorption_fraction: float
+
+
+@dataclass(frozen=True)
 class Region:
-    """一个材料区：厚度、D、Σa、νΣf、网格数。"""
+    """一个材料区：厚度、D、Σa、νΣf、网格数；可选燃耗声明。"""
     thickness: float
     D: float
     sigma_a: float
     nu_sigma_f: float
     n_mesh: int
+    burnup: Optional[BurnupRegion] = None
 
     @property
     def h(self) -> float:
         return self.thickness / self.n_mesh
+
+
+def region_from_dict(data: dict) -> Region:
+    """从存储/接口字典构造 Region。
+
+    老数据没有 "burnup" 键（或为 None）→ 不燃耗的区；有则转成 BurnupRegion。
+    """
+    d = dict(data)
+    b = d.pop("burnup", None)
+    if b is not None and not isinstance(b, BurnupRegion):
+        b = BurnupRegion(**b)
+    return Region(**d, burnup=b)
 
 
 @dataclass(frozen=True)
